@@ -53,12 +53,9 @@ def add_srs_entry(
             "compatible with the spatial backend."
         )
 
-    # Existing definitions may have different WKT or projection text.
-    entries = SpatialRefSys.objects.using(database)
-    if entries.filter(srid=srs.srid).exists():
-        return
-
     if connection.ops.mysql:
+        if SpatialRefSys.objects.using(database).filter(srid=srs.srid).exists():
+            return
         # MySQL exposes spatial reference systems through a read-only view.
         with connection.schema_editor() as editor:
             editor.execute(
@@ -69,7 +66,7 @@ def add_srs_entry(
                     ref_sys_name or srs.name,
                     srs.wkt,
                     auth_name,
-                    auth_srid or srs.srid,
+                    srs.srid if auth_srid is None else auth_srid,
                 ),
             )
         return
@@ -90,4 +87,10 @@ def add_srs_entry(
         # SpatiaLite specific
         kwargs["ref_sys_name"] = ref_sys_name or srs.name
 
-    entries.create(**kwargs)
+    # Creating the spatial_ref_sys model.
+    try:
+        # Try getting via SRID only, because using all kwargs may
+        # differ from exact wkt/proj in database.
+        SpatialRefSys.objects.using(database).get(srid=srs.srid)
+    except SpatialRefSys.DoesNotExist:
+        SpatialRefSys.objects.using(database).create(**kwargs)

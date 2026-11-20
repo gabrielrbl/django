@@ -9,8 +9,6 @@ from django.contrib.gis.geos.prototypes.io import wkb_r
 from django.contrib.gis.measure import Distance
 from django.db.backends.mysql.operations import DatabaseOperations
 
-from .models import MySQLGeometryColumns, MySQLSpatialRefSys
-
 
 class MySQLOperations(BaseSpatialOperations, DatabaseOperations):
     name = "mysql"
@@ -156,11 +154,15 @@ class MySQLOperations(BaseSpatialOperations, DatabaseOperations):
     def geometry_columns(self):
         if self.mariadb:
             return super().geometry_columns()
+        from .models import MySQLGeometryColumns
+
         return MySQLGeometryColumns
 
     def spatial_ref_sys(self):
         if self.mariadb:
             return super().spatial_ref_sys()
+        from .models import MySQLSpatialRefSys
+
         return MySQLSpatialRefSys
 
     def spatial_aggregate_name(self, agg_name):
