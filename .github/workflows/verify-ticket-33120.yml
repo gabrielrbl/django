@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ["mysql:8.4", "mariadb:10.11"]
+        image: ["mysql:8.4", "mysql:9.7"]
     services:
       mysql:
         image: ${{ matrix.image }}
@@ -35,7 +35,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libgdal34t64 default-libmysqlclient-dev pkg-config python3-venv python3-dev
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/python" -m pip install -e . mysqlclient Pillow tblib
-      - name: Run GeoDjango on MySQL
+      - name: Configure two disposable databases
         run: |
           cat > "$RUNNER_TEMP/ticket_mysql.py" <<'PY'
           from test_sqlite import PASSWORD_HASHERS, SECRET_KEY, USE_TZ
@@ -56,209 +56,110 @@ jobs:
                   cursor.execute("CREATE DATABASE ticket33120_default")
                   cursor.execute("CREATE DATABASE ticket33120_other")
           PY
-          cd tests
-          PYTHONPATH="$RUNNER_TEMP:$PWD/.." "$RUNNER_TEMP/venv/bin/python" runtests.py --settings=ticket_mysql --parallel=1 --shuffle=33120 gis_tests
-      - name: Exercise startup, catalog isolation, concurrent registration and atomicity
-        run: |
-          cat > "$RUNNER_TEMP/stress_mysql.py" <<'PY'
+          git fetch --depth=1 https://github.com/django/django.git c67d872765e05ebd009fadf7de8d834b01bae9e4
+          git worktree add --detach "$RUNNER_TEMP/base" FETCH_HEAD
+          cat > "$RUNNER_TEMP/round3.py" <<'PY'
           import os
-          from concurrent.futures import ThreadPoolExecutor
-          from threading import Barrier
-          from unittest.mock import patch
-          
+          import sys
           from django.conf import settings
           from ticket_mysql import DATABASES
           settings.configure(DATABASES=DATABASES, INSTALLED_APPS=["django.contrib.gis"], SECRET_KEY="test")
-          from django.db import connections, transaction, NotSupportedError
-          from django.db.transaction import TransactionManagementError
-          from django.contrib.gis.gdal import SpatialReference
-          from django.contrib.gis.db.models import PointField
-          from django.contrib.gis.utils import add_srs_entry
           import django
-          assert connections["default"].vendor == "mysql"
           django.setup()
-          db = connections["default"]
-          other = connections["other"]
-          with db.cursor() as c:
-              c.execute("SELECT VERSION()")
-              print("Server", c.fetchone(), flush=True)
-          if db.mysql_is_mariadb:
-              assert not db.features.has_spatialrefsys_table and not db.features.supports_add_srs_entry
-              for method in (db.ops.geometry_columns, db.ops.spatial_ref_sys):
-                  try:
-                      method()
-                  except NotImplementedError:
-                      pass
-                  else:
-                      raise AssertionError(method)
-              try:
-                  add_srs_entry(4326)
-              except Exception as e:
-                  assert "does not support your database backend" in str(e)
-              else:
-                  raise AssertionError("MariaDB accepted registration")
-              print("MariaDB's pre-existing metadata and registration behavior verified.")
-              raise SystemExit
+          from django.db import connection, DatabaseError
+          from django.contrib.gis.db import models
+          from django.contrib.gis.gdal import SpatialReference
+          from django.contrib.gis.geos import Point
+          from django.contrib.gis.utils import add_srs_entry
+          from django.db.models import F, Subquery, OuterRef
           
-          columns = db.ops.geometry_columns().objects
-          srs = db.ops.spatial_ref_sys().objects
-          for alias, sql in (("default", "CREATE TABLE twin (loc POINT, shape LINESTRING SRID 4326)"), ("other", "CREATE TABLE twin (loc POLYGON SRID 3857)")):
-              with connections[alias].cursor() as c:
-                  c.execute(sql)
-          for alias, expected in (("default", {"loc": ("point", None), "shape": ("linestring", 4326)}), ("other", {"loc": ("polygon", 3857)})):
-              fields = columns.using(alias).filter(f_table_name="twin")
-              assert {f.f_geometry_column:(f.type.lower(), f.srid) for f in fields} == expected
-              for f in fields:
-                  assert fields.get(pk=f.pk).f_table_schema == DATABASES[alias]["NAME"]
-          with db.cursor() as c:
-              c.execute("ALTER TABLE twin DROP COLUMN shape")
-          assert columns.filter(f_table_name="twin").count() == 1
-          print("Same-name tables in different databases, composite keys, typed and unrestricted SRIDs, and DDL introspection passed.")
-          def custom(srid):
-              return SpatialReference(SpatialReference(4326).wkt.replace('AUTHORITY["EPSG","4326"]', f'AUTHORITY["Django","{srid}"]'))
-          race_id = 110033120
-          assert not srs.filter(pk=race_id).exists()
-          with transaction.atomic():
-              add_srs_entry(4326)
+          class Place(models.Model):
+              name = models.CharField(max_length=16)
+              location = models.PointField()
+              class Meta:
+                  app_label="gis"
+                  db_table="Round3 places"
+          
+          phase=sys.argv[1]
+          def raw_rows():
+              with connection.cursor() as c:
+                  c.execute("SELECT name, ST_X(location), ST_Y(location), ST_SRID(location) FROM `Round3 places` ORDER BY id")
+                  return list(c.fetchall())
+          if phase=="write-old":
+              with connection.schema_editor() as editor:
+                  editor.create_model(Place)
+              Place.objects.bulk_create([Place(name="legacy",location=Point(-43.2,-22.9,srid=4326)),Place(name="untouched",location=Point(15,30,srid=4326))])
+              assert raw_rows()==[("legacy",-43.2,-22.9,0),("untouched",15,30,0)]
+          elif phase=="update-new":
+              assert Place.objects.get(name="legacy").location == Point(-43.2,-22.9,srid=4326)
+              Place.objects.filter(name="legacy").update(location=Point(120,-45,srid=4326))
+              Place.objects.create(name="new",location=Point(-170,80,srid=4326))
+              assert list(Place.objects.filter(location=Point(120,-45,srid=4326)).values_list("name",flat=True)) == ["legacy"]
+          elif phase=="read-old":
+              assert raw_rows()==[("legacy",120,-45,0),("untouched",15,30,0),("new",-170,80,0)]
+              assert [p.location.coords for p in Place.objects.order_by("id")] == [(120,-45),(15,30),(-170,80)]
+              assert {p.location.srid for p in Place.objects.all()} == {4326}
+          elif phase=="catalog":
+              with connection.cursor() as c:
+                  c.execute("SELECT VERSION(), @@SESSION.sql_mode")
+                  print(c.fetchone(),flush=True)
+                  c.execute("ALTER TABLE `Round3 places` ADD `Outra área` POLYGON SRID 3857")
+              cols=connection.ops.geometry_columns().objects.filter(f_table_name=Place._meta.db_table)
+              assert cols.count()==2
+              schema=connection.settings_dict["NAME"]
+              keys=[(schema,Place._meta.db_table,n) for n in ("location","Outra área")]
+              assert {k:v.srid for k,v in cols.in_bulk(keys).items()}=={keys[0]:None, keys[1]:3857}
+              row=cols.defer("srid","type").get(pk=keys[1])
+              assert row.srid==3857 and row.type.lower()=="polygon"
+              row.refresh_from_db()
+              catalog=connection.ops.spatial_ref_sys().objects
+              sub=catalog.filter(srid=OuterRef("srid")).values("auth_name")[:1]
+              assert {n:a for n,a in cols.annotate(authority=Subquery(sub)).values_list("f_geometry_column","authority")}=={"location":None,"Outra área":"EPSG"}
+              # The catalog stores both the SRS and its authority code as unsigned integers.
+              i=3_000_033_120
+              assert not catalog.filter(srid=i).exists()
+              ref=SpatialReference(SpatialReference(4326).wkt.replace('AUTHORITY["EPSG","4326"]',f'AUTHORITY["Django","{i}"]'))
+              assert ref.srid==i
+              label="Projeção d'água 100% R3"
+              with connection.cursor() as c:
+                  c.execute("SET SESSION sql_mode = CONCAT_WS(',',NULLIF(@@SESSION.sql_mode,''),'NO_BACKSLASH_ESCAPES')")
+              add_srs_entry(ref,auth_name="Round 3",auth_srid=4_000_000_000,ref_sys_name=label)
+              entry=catalog.get(pk=i)
+              assert entry.ref_sys_name==label and entry.auth_srid==4_000_000_000 and entry.geographic
+              assert not catalog.filter(pk=i+1).exists()
+              ref2=SpatialReference(ref.wkt.replace(str(i),str(i+1)))
               try:
-                  add_srs_entry(custom(race_id), ref_sys_name="atomic test")
-              except TransactionManagementError:
+                  add_srs_entry(ref2,auth_name="Round 3",ref_sys_name=label)
+              except DatabaseError:
                   pass
               else:
-                  raise AssertionError("DDL committed inside atomic")
-          assert not srs.filter(pk=race_id).exists()
-          with db.cursor() as c:
-              c.execute("CREATE TABLE tx_guard (id INT) ENGINE=InnoDB")
-          db.set_autocommit(False)
-          try:
-              with db.cursor() as c:
-                  c.execute("INSERT INTO tx_guard VALUES (1)")
-              try:
-                  add_srs_entry(custom(race_id), ref_sys_name="manual transaction")
-              except TransactionManagementError:
-                  pass
-              else:
-                  raise AssertionError("User-managed transaction was committed")
-          finally:
-              db.rollback()
-              db.set_autocommit(True)
-          with db.cursor() as c:
-              c.execute("SELECT COUNT(*) FROM tx_guard")
-              assert c.fetchone() == (0,)
-              c.execute("CREATE USER 'catalog_reader'@'%' IDENTIFIED BY 'reader_test_only'")
-              c.execute("GRANT SELECT ON ticket33120_default.* TO 'catalog_reader'@'%'")
-          connections.databases["reader"] = dict(db.settings_dict, USER="catalog_reader", PASSWORD="reader_test_only")
-          add_srs_entry(4326, database="reader")
-          from django.db import DatabaseError
-          try:
-              add_srs_entry(custom(race_id), database="reader", ref_sys_name="reader creation")
-          except DatabaseError as e:
-              assert e.args[0] == 3631 and 'privilege' in str(e), e.args
+                  raise AssertionError("Duplicate SRS name accepted")
+              assert not catalog.filter(pk=i+1).exists()
+              entry.refresh_from_db()
+              assert entry.auth_srid==4_000_000_000 and entry.ref_sys_name==label
+              with connection.cursor() as c:
+                  c.execute("DROP SPATIAL REFERENCE SYSTEM %s",[i])
           else:
-              raise AssertionError("Read-only user created SRS")
-          assert not srs.filter(pk=race_id).exists()
-          print("Manual rollback preserved an unrelated write boundary; SELECT-only account could read and reuse an SRS, and could not create one.")
-          gate = Barrier(8)
-          from django.db.models.query import QuerySet
-          old = QuerySet.exists
-          def synchronized(qs):
-              found = old(qs)
-              gate.wait(timeout=30)
-              return found
-          def register(k):
-              try:
-                  add_srs_entry(custom(race_id), auth_name="Django", ref_sys_name="Django's race %s" % k, database="other" if k%2 else "default")
-              finally:
-                  connections.close_all()
-          with patch.object(QuerySet, "exists", synchronized), ThreadPoolExecutor(max_workers=8) as pool:
-              list(pool.map(register, range(8)))
-          entry = srs.using("other").get(pk=race_id)
-          assert entry.ref_sys_name.startswith("Django's race ") and entry.auth_srid == race_id
-          for _ in range(40):
-              add_srs_entry(custom(race_id), ref_sys_name="replacement")
-          assert srs.get(pk=race_id).ref_sys_name == entry.ref_sys_name
-          print("8 simultaneous registrations, 40 retries, quoted names, transaction guard and cross-alias visibility passed.")
-          known = set(srs.values_list("srid",flat=True))
-          from django.contrib.gis.gdal.error import GDALException
-          for candidate in [8857,7855,9473, 8858, 9709, 9895, 3035, 32600, *range(9000,10000)]:
-              if candidate in known:
-                  continue
-              try:
-                  if not SpatialReference(candidate).projected:
-                      continue
-              except GDALException:
-                  continue
-              break
-          else:
-              raise AssertionError("No GDAL-only projected EPSG found")
-          field = PointField(srid=candidate)
-          for conn in (db,other):
-              assert not field.geodetic(conn)
-          add_srs_entry(custom(candidate), auth_name="Django", ref_sys_name="Newly registered test SRS", database="other")
-          for conn in (db,other):
-              assert field.geodetic(conn), "An earlier fallback hid the registered definition"
-          print("GDAL fallback refreshed on both open aliases after registration for SRID", candidate)
-          for value in (candidate,race_id):
-              with db.cursor() as c:
-                  c.execute("DROP SPATIAL REFERENCE SYSTEM %s",[value])
-          with db.cursor() as c:
-              c.execute("SELECT COUNT(*) FROM INFORMATION_SCHEMA.ST_SPATIAL_REFERENCE_SYSTEMS WHERE SRS_ID IN (%s,%s)",[race_id,candidate])
-              assert c.fetchone() == (0,)
-          try:
-              db.ops.spatial_function_name("Transform")
-          except NotSupportedError:
-              pass
-          else:
-              raise AssertionError("Transform was enabled")
+              raise AssertionError(phase)
+          print("PASS",phase,flush=True)
           PY
-          PYTHONPATH="$RUNNER_TEMP:$PWD/tests:$PWD" "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/stress_mysql.py"
-      - name: Verify the regression and the SRID control on upstream main
-        if: matrix.image == 'mysql:8.4'
+      - name: Check an application table across an upgrade and rollback
         run: |
-          git fetch --depth=1 https://github.com/django/django.git c67d872765e05ebd009fadf7de8d834b01bae9e4
-          git worktree add --detach "$RUNNER_TEMP/upstream" FETCH_HEAD
-          for path in gis_tests/test_spatialrefsys.py gis_tests/gis_migrations/test_operations.py gis_tests/geoapp/tests.py; do
-            cp "tests/$path" "$RUNNER_TEMP/upstream/tests/$path"
+          for phase in write-old update-new read-old; do
+            src="$PWD"
+            if [ "$phase" != update-new ]; then src="$RUNNER_TEMP/base"; fi
+            PYTHONPATH="$src:$src/tests:$RUNNER_TEMP" "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/round3.py" "$phase"
           done
-          cd "$RUNNER_TEMP/upstream/tests"
-          export PYTHONPATH="$RUNNER_TEMP:$PWD/.."
-          if "$RUNNER_TEMP/venv/bin/python" runtests.py --settings=ticket_mysql --parallel=1 \
-               gis_tests.test_spatialrefsys.MySQLSpatialRefSysTests.test_add_custom_entry \
-               gis_tests.gis_migrations.test_operations.OperationTests.test_mysql_geometry_column \
-               gis_tests.geoapp.tests.GeoModelTest.test_stored_srid >"$RUNNER_TEMP/base.log" 2>&1; then
-            cat "$RUNNER_TEMP/base.log"
-            exit 1
-          fi
-          cat "$RUNNER_TEMP/base.log"
-          grep -F 'Ran 3 tests' "$RUNNER_TEMP/base.log"
-          grep -F 'FAILED (errors=2)' "$RUNNER_TEMP/base.log"
-          grep -F 'NotImplementedError:' "$RUNNER_TEMP/base.log" | grep 'geometry_columns()'
-          grep -F 'NotImplementedError:' "$RUNNER_TEMP/base.log" | grep 'spatial_ref_sys()'
-  postgis:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    services:
-      postgres:
-        image: postgis/postgis:17-3.5
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd="pg_isready -U postgres"
-          --health-interval=5s --health-timeout=3s --health-retries=30
-    steps:
-      - name: Test GeoDjango with PostGIS
+      - name: Check ORM metadata queries, large IDs and registration error recovery
         run: |
-          git init .
-          git fetch --depth=1 https://github.com/gabrielrbl/django.git b20882736452579ece291c9a48c003166cf74cd9
-          git checkout --detach FETCH_HEAD
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libgdal34t64 python3-venv
-          python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/python" -m pip install -e . "psycopg[binary]" Pillow tblib
-          cat > "$RUNNER_TEMP/ticket_postgis.py" <<'PY'
-          from test_sqlite import PASSWORD_HASHERS, SECRET_KEY, USE_TZ
-          DATABASES = {alias: {"ENGINE":"django.contrib.gis.db.backends.postgis","NAME":"postgres" if alias=="default" else "other","HOST":"127.0.0.1","USER":"postgres","PASSWORD":"postgres"} for alias in ("default","other")}
-          PY
+          PYTHONPATH="$PWD:$PWD/tests:$RUNNER_TEMP" "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/round3.py" catalog
+      - name: Run the candidate GeoDjango suite
+        if: ${{ !cancelled() }}
+        run: |
           cd tests
-          PYTHONPATH="$RUNNER_TEMP:$PWD/.." "$RUNNER_TEMP/venv/bin/python" runtests.py --settings=ticket_postgis --parallel=1 --shuffle=33120 gis_tests
+          PYTHONPATH="$RUNNER_TEMP:$PWD/.." "$RUNNER_TEMP/venv/bin/python" runtests.py --settings=ticket_mysql --parallel=1 --shuffle=9133120 gis_tests
+      - name: Run the reference GeoDjango suite
+        if: ${{ !cancelled() }}
+        run: |
+          cd "$RUNNER_TEMP/base/tests"
+          PYTHONPATH="$RUNNER_TEMP:$PWD/.." "$RUNNER_TEMP/venv/bin/python" runtests.py --settings=ticket_mysql --parallel=1 --shuffle=9133120 gis_tests
