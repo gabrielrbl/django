@@ -44,5 +44,33 @@ jobs:
               for alias in ("default", "other")
           }
           PY
+          "$RUNNER_TEMP/venv/bin/python" - <<'PY'
+          import MySQLdb
+          with MySQLdb.connect(host="127.0.0.1", port=33060, user="root", passwd="django_test_only") as conn:
+              with conn.cursor() as cursor:
+                  cursor.execute("CREATE DATABASE ticket33120_default")
+                  cursor.execute("CREATE DATABASE ticket33120_other")
+          PY
           cd tests
           PYTHONPATH="$RUNNER_TEMP:$PWD/.." "$RUNNER_TEMP/venv/bin/python" runtests.py --settings=ticket_mysql --parallel=1 gis_tests
+      - name: Verify the regression and the SRID control on upstream main
+        run: |
+          git fetch --depth=1 https://github.com/django/django.git c67d872765e05ebd009fadf7de8d834b01bae9e4
+          git worktree add --detach "$RUNNER_TEMP/upstream" FETCH_HEAD
+          for path in gis_tests/test_spatialrefsys.py gis_tests/gis_migrations/test_operations.py gis_tests/geoapp/tests.py; do
+            cp "tests/$path" "$RUNNER_TEMP/upstream/tests/$path"
+          done
+          cd "$RUNNER_TEMP/upstream/tests"
+          export PYTHONPATH="$RUNNER_TEMP:$PWD/.."
+          if "$RUNNER_TEMP/venv/bin/python" runtests.py --settings=ticket_mysql --parallel=1 \
+               gis_tests.test_spatialrefsys.MySQLSpatialRefSysTests.test_add_custom_entry \
+               gis_tests.gis_migrations.test_operations.OperationTests.test_mysql_geometry_column \
+               gis_tests.geoapp.tests.GeoModelTest.test_stored_srid >"$RUNNER_TEMP/base.log" 2>&1; then
+            cat "$RUNNER_TEMP/base.log"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/base.log"
+          grep -F 'Ran 3 tests' "$RUNNER_TEMP/base.log"
+          grep -F 'FAILED (errors=2)' "$RUNNER_TEMP/base.log"
+          grep -F 'NotImplementedError:' "$RUNNER_TEMP/base.log" | grep 'geometry_columns()'
+          grep -F 'NotImplementedError:' "$RUNNER_TEMP/base.log" | grep 'spatial_ref_sys()'
