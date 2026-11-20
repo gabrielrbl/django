@@ -63,7 +63,11 @@ def get_srid_info(srid, connection):
         except ObjectDoesNotExist:
             if not connection.ops.mysql:
                 raise
-            # MySQL historically allowed field SRIDs known only to GDAL.
+            # MySQL allows SRIDs known only to GDAL. Keep the fallback out of
+            # the database cache since the SRID may be registered later.
+            alias = None
+            if srid in _srid_cache[alias]:
+                return _srid_cache[alias][srid]
             srs = SpatialReference(srid)
         units, units_name = srs.units
         _srid_cache[alias][srid] = SRIDCacheEntry(

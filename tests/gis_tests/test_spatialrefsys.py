@@ -4,6 +4,7 @@ from unittest import skipUnless
 from uuid import uuid4
 
 from django.contrib.gis.db.backends.base.models import SpatialRefSysMixin
+from django.contrib.gis.db.models import PointField
 from django.contrib.gis.gdal import SpatialReference
 from django.contrib.gis.utils import add_srs_entry
 from django.db import connection
@@ -181,15 +182,17 @@ class MySQLSpatialRefSysTests(TransactionTestCase):
             'AUTHORITY["EPSG","4326"]', f'AUTHORITY["Django","{srid}"]'
         )
         srs = SpatialReference(wkt)
-        name = f"Django test {srid}"
-        add_srs_entry(srs, auth_name="Django", ref_sys_name=name)
+        name = f"Django's test {srid}"
+        authority = f"Django {srid}"
+        add_srs_entry(srs, auth_name=authority, auth_srid=0, ref_sys_name=name)
         try:
             # Registering the SRID again preserves its definition.
             add_srs_entry(srs, auth_name="Django", ref_sys_name="other")
             entry = entries.get(srid=srid)
             self.assertEqual(entry.ref_sys_name, name)
-            self.assertEqual(entry.auth_name, "Django")
-            self.assertEqual(entry.auth_srid, srid)
+            self.assertEqual(entry.auth_name, authority)
+            self.assertEqual(entry.auth_srid, 0)
+            self.assertTrue(PointField(srid=srid).geodetic(connection))
             self.assertTrue(entry.geographic)
         finally:
             with connection.cursor() as cursor:
