@@ -170,6 +170,8 @@ class SpatialRefSysTest(TestCase):
 
 @skipUnless(connection.ops.mysql, "MySQL specific test.")
 class MySQLSpatialRefSysTests(TransactionTestCase):
+    available_apps = ["django.contrib.gis"]
+
     def test_add_custom_entry(self):
         # The SRS catalog is shared by all databases on the server.
         srid = 100_000_000 + uuid4().int % 100_000_000
