@@ -22,12 +22,12 @@ jobs:
       - name: Check out the contribution
         run: |
           git init .
-          git fetch --depth=1 https://github.com/gabrielrbl/django.git f29eda1fea21e250e7efb9356e56c8fca5c8370b
+          git fetch --depth=1 https://github.com/gabrielrbl/django.git 077c01a1edb916bb685e8c61298fc8731b1bf16e
           git checkout --detach FETCH_HEAD
       - name: Install test dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libgdal-dev default-libmysqlclient-dev pkg-config python3-venv python3-dev
+          sudo apt-get install -y --no-install-recommends libgdal34t64 default-libmysqlclient-dev pkg-config python3-venv python3-dev
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/python" -m pip install -e . mysqlclient Pillow tblib
       - name: Run GeoDjango on MySQL
