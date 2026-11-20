@@ -27,7 +27,7 @@ jobs:
       - name: Check out the contribution
         run: |
           git init .
-          git fetch --depth=1 https://github.com/gabrielrbl/django.git 0ceb9ca5c27f67af7432aa86a8757154ce20aa35
+          git fetch --depth=1 https://github.com/gabrielrbl/django.git b20882736452579ece291c9a48c003166cf74cd9
           git checkout --detach FETCH_HEAD
       - name: Install test dependencies
         run: |
@@ -127,6 +127,37 @@ jobs:
               else:
                   raise AssertionError("DDL committed inside atomic")
           assert not srs.filter(pk=race_id).exists()
+          with db.cursor() as c:
+              c.execute("CREATE TABLE tx_guard (id INT) ENGINE=InnoDB")
+          db.set_autocommit(False)
+          try:
+              with db.cursor() as c:
+                  c.execute("INSERT INTO tx_guard VALUES (1)")
+              try:
+                  add_srs_entry(custom(race_id), ref_sys_name="manual transaction")
+              except TransactionManagementError:
+                  pass
+              else:
+                  raise AssertionError("User-managed transaction was committed")
+          finally:
+              db.rollback()
+              db.set_autocommit(True)
+          with db.cursor() as c:
+              c.execute("SELECT COUNT(*) FROM tx_guard")
+              assert c.fetchone() == (0,)
+              c.execute("CREATE USER 'catalog_reader'@'%' IDENTIFIED BY 'reader_test_only'")
+              c.execute("GRANT SELECT ON ticket33120_default.* TO 'catalog_reader'@'%'")
+          connections.databases["reader"] = dict(db.settings_dict, USER="catalog_reader", PASSWORD="reader_test_only")
+          add_srs_entry(4326, database="reader")
+          from django.db import DatabaseError
+          try:
+              add_srs_entry(custom(race_id), database="reader", ref_sys_name="reader creation")
+          except DatabaseError as e:
+              assert e.args[0] == 1227, e.args
+          else:
+              raise AssertionError("Read-only user created SRS")
+          assert not srs.filter(pk=race_id).exists()
+          print("Manual rollback preserved an unrelated write boundary; SELECT-only account could read and reuse an SRS, and could not create one.")
           gate = Barrier(8)
           from django.db.models.query import QuerySet
           old = QuerySet.exists
@@ -219,7 +250,7 @@ jobs:
       - name: Test GeoDjango with PostGIS
         run: |
           git init .
-          git fetch --depth=1 https://github.com/gabrielrbl/django.git 0ceb9ca5c27f67af7432aa86a8757154ce20aa35
+          git fetch --depth=1 https://github.com/gabrielrbl/django.git b20882736452579ece291c9a48c003166cf74cd9
           git checkout --detach FETCH_HEAD
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libgdal34t64 python3-venv
