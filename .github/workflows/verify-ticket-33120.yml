@@ -1,0 +1,48 @@
+name: Verify GeoDjango ticket 33120 on MySQL
+on:
+  push:
+    branches: [verify-33120-mysql]
+permissions:
+  contents: read
+jobs:
+  gis:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: django_test_only
+          MYSQL_ROOT_HOST: "%"
+        ports: ["33060:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping --silent --host=127.0.0.1"
+          --health-interval=5s --health-timeout=3s --health-retries=30
+    steps:
+      - name: Check out the contribution
+        run: |
+          git init .
+          git fetch --depth=1 https://github.com/gabrielrbl/django.git f29eda1fea21e250e7efb9356e56c8fca5c8370b
+          git checkout --detach FETCH_HEAD
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgdal-dev default-libmysqlclient-dev pkg-config python3-venv python3-dev
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install -e . mysqlclient Pillow tblib
+      - name: Run GeoDjango on MySQL
+        run: |
+          cat > "$RUNNER_TEMP/ticket_mysql.py" <<'PY'
+          from test_sqlite import PASSWORD_HASHERS, SECRET_KEY, USE_TZ
+          DATABASES = {
+              alias: {
+                  "ENGINE": "django.contrib.gis.db.backends.mysql",
+                  "NAME": "ticket33120_" + alias,
+                  "USER": "root", "PASSWORD": "django_test_only",
+                  "HOST": "127.0.0.1", "PORT": "33060",
+              }
+              for alias in ("default", "other")
+          }
+          PY
+          cd tests
+          PYTHONPATH="$RUNNER_TEMP:$PWD/.." "$RUNNER_TEMP/venv/bin/python" runtests.py --settings=ticket_mysql --parallel=1 gis_tests
