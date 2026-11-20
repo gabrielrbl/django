@@ -1,5 +1,6 @@
 from django.contrib.gis.gdal import SpatialReference
 from django.db import DEFAULT_DB_ALIAS, connections
+from django.db.transaction import TransactionManagementError
 
 
 def add_srs_entry(
@@ -56,9 +57,13 @@ def add_srs_entry(
     if connection.ops.mysql:
         if SpatialRefSys.objects.using(database).filter(srid=srs.srid).exists():
             return
-        # MySQL exposes spatial reference systems through a read-only view.
-        with connection.schema_editor() as editor:
-            editor.execute(
+        # Creating a MySQL SRS implicitly commits any open transaction.
+        if not connection.get_autocommit():
+            raise TransactionManagementError(
+                "Adding a spatial reference system on MySQL requires autocommit."
+            )
+        with connection.cursor() as cursor:
+            cursor.execute(
                 "CREATE SPATIAL REFERENCE SYSTEM IF NOT EXISTS %s "
                 "NAME %s DEFINITION %s ORGANIZATION %s IDENTIFIED BY %s",
                 (
