@@ -25,7 +25,7 @@ def add_srs_entry(
        Defaults to the SRID determined by GDAL.
 
      ref_sys_name:
-       For SpatiaLite users only, sets the value of the `ref_sys_name` field.
+       For MySQL and SpatiaLite, the name of the spatial reference system.
        Defaults to the name determined by GDAL.
 
      database:
@@ -53,6 +53,27 @@ def add_srs_entry(
             "compatible with the spatial backend."
         )
 
+    # Existing definitions may have different WKT or projection text.
+    entries = SpatialRefSys.objects.using(database)
+    if entries.filter(srid=srs.srid).exists():
+        return
+
+    if connection.ops.mysql:
+        # MySQL exposes spatial reference systems through a read-only view.
+        with connection.schema_editor() as editor:
+            editor.execute(
+                "CREATE SPATIAL REFERENCE SYSTEM IF NOT EXISTS %s "
+                "NAME %s DEFINITION %s ORGANIZATION %s IDENTIFIED BY %s",
+                (
+                    srs.srid,
+                    ref_sys_name or srs.name,
+                    srs.wkt,
+                    auth_name,
+                    auth_srid or srs.srid,
+                ),
+            )
+        return
+
     # Initializing the keyword arguments dictionary for both PostGIS
     # and SpatiaLite.
     kwargs = {
@@ -69,10 +90,4 @@ def add_srs_entry(
         # SpatiaLite specific
         kwargs["ref_sys_name"] = ref_sys_name or srs.name
 
-    # Creating the spatial_ref_sys model.
-    try:
-        # Try getting via SRID only, because using all kwargs may
-        # differ from exact wkt/proj in database.
-        SpatialRefSys.objects.using(database).get(srid=srs.srid)
-    except SpatialRefSys.DoesNotExist:
-        SpatialRefSys.objects.using(database).create(**kwargs)
+    entries.create(**kwargs)
