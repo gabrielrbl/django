@@ -30,9 +30,9 @@ backends like PostGIS.
 
     On MySQL, ``django.contrib.gis.utils.add_srs_entry()`` registers a spatial
     reference system if its SRID is missing from the server catalog. Creating
-    an entry requires permission to create spatial reference systems and must
-    be done outside an atomic block. Spatial reference systems are shared by
-    all databases on the server.
+    an entry requires autocommit and permission to create spatial reference
+    systems. Spatial reference systems are shared by all databases on the
+    server.
 
 Raster Support
 --------------

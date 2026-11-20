@@ -8,6 +8,7 @@ from django.contrib.gis.db.models import PointField
 from django.contrib.gis.gdal import SpatialReference
 from django.contrib.gis.utils import add_srs_entry
 from django.db import connection
+from django.db.transaction import TransactionManagementError
 from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
 
 test_srs = (
@@ -184,8 +185,15 @@ class MySQLSpatialRefSysTests(TransactionTestCase):
         srs = SpatialReference(wkt)
         name = f"Django's test {srid}"
         authority = f"Django {srid}"
-        add_srs_entry(srs, auth_name=authority, auth_srid=0, ref_sys_name=name)
         try:
+            connection.set_autocommit(False)
+            try:
+                with self.assertRaisesMessage(TransactionManagementError, "autocommit"):
+                    add_srs_entry(srs, auth_name=authority, ref_sys_name=name)
+            finally:
+                connection.rollback()
+                connection.set_autocommit(True)
+            add_srs_entry(srs, auth_name=authority, auth_srid=0, ref_sys_name=name)
             # Registering the SRID again preserves its definition.
             add_srs_entry(srs, auth_name="Django", ref_sys_name="other")
             entry = entries.get(srid=srid)
@@ -196,4 +204,4 @@ class MySQLSpatialRefSysTests(TransactionTestCase):
             self.assertTrue(entry.geographic)
         finally:
             with connection.cursor() as cursor:
-                cursor.execute("DROP SPATIAL REFERENCE SYSTEM %s", [srid])
+                cursor.execute("DROP SPATIAL REFERENCE SYSTEM IF EXISTS %s", [srid])
