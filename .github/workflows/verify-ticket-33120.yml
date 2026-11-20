@@ -8,21 +8,26 @@ jobs:
   gis:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    name: GeoDjango on ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["mysql:8.4", "mariadb:10.11"]
     services:
       mysql:
-        image: mysql:8.4
+        image: ${{ matrix.image }}
         env:
           MYSQL_ROOT_PASSWORD: django_test_only
           MYSQL_ROOT_HOST: "%"
         ports: ["33060:3306"]
         options: >-
-          --health-cmd="mysqladmin ping --silent --host=127.0.0.1"
+          --health-cmd="if command -v mariadb-admin >/dev/null; then mariadb-admin ping --silent --host=127.0.0.1; else mysqladmin ping --silent --host=127.0.0.1; fi"
           --health-interval=5s --health-timeout=3s --health-retries=30
     steps:
       - name: Check out the contribution
         run: |
           git init .
-          git fetch --depth=1 https://github.com/gabrielrbl/django.git 077c01a1edb916bb685e8c61298fc8731b1bf16e
+          git fetch --depth=1 https://github.com/gabrielrbl/django.git 0ceb9ca5c27f67af7432aa86a8757154ce20aa35
           git checkout --detach FETCH_HEAD
       - name: Install test dependencies
         run: |
@@ -52,8 +57,132 @@ jobs:
                   cursor.execute("CREATE DATABASE ticket33120_other")
           PY
           cd tests
-          PYTHONPATH="$RUNNER_TEMP:$PWD/.." "$RUNNER_TEMP/venv/bin/python" runtests.py --settings=ticket_mysql --parallel=1 gis_tests
+          PYTHONPATH="$RUNNER_TEMP:$PWD/.." "$RUNNER_TEMP/venv/bin/python" runtests.py --settings=ticket_mysql --parallel=1 --shuffle=33120 gis_tests
+      - name: Exercise startup, catalog isolation, concurrent registration and atomicity
+        run: |
+          cat > "$RUNNER_TEMP/stress_mysql.py" <<'PY'
+          import os
+          from concurrent.futures import ThreadPoolExecutor
+          from threading import Barrier
+          from unittest.mock import patch
+          
+          from django.conf import settings
+          from ticket_mysql import DATABASES
+          settings.configure(DATABASES=DATABASES, INSTALLED_APPS=["django.contrib.gis"], SECRET_KEY="test")
+          from django.db import connections, transaction, NotSupportedError
+          from django.db.transaction import TransactionManagementError
+          from django.contrib.gis.gdal import SpatialReference
+          from django.contrib.gis.db.models import PointField
+          from django.contrib.gis.utils import add_srs_entry
+          import django
+          assert connections["default"].vendor == "mysql"
+          django.setup()
+          db = connections["default"]
+          other = connections["other"]
+          with db.cursor() as c:
+              c.execute("SELECT VERSION()")
+              print("Server", c.fetchone(), flush=True)
+          if db.mysql_is_mariadb:
+              assert not db.features.has_spatialrefsys_table and not db.features.supports_add_srs_entry
+              for method in (db.ops.geometry_columns, db.ops.spatial_ref_sys):
+                  try:
+                      method()
+                  except NotImplementedError:
+                      pass
+                  else:
+                      raise AssertionError(method)
+              try:
+                  add_srs_entry(4326)
+              except Exception as e:
+                  assert "does not support your database backend" in str(e)
+              else:
+                  raise AssertionError("MariaDB accepted registration")
+              print("MariaDB's pre-existing metadata and registration behavior verified.")
+              raise SystemExit
+          
+          columns = db.ops.geometry_columns().objects
+          srs = db.ops.spatial_ref_sys().objects
+          for alias, sql in (("default", "CREATE TABLE twin (loc POINT, shape LINESTRING SRID 4326)"), ("other", "CREATE TABLE twin (loc POLYGON SRID 3857)")):
+              with connections[alias].cursor() as c:
+                  c.execute(sql)
+          for alias, expected in (("default", {"loc": ("point", None), "shape": ("linestring", 4326)}), ("other", {"loc": ("polygon", 3857)})):
+              fields = columns.using(alias).filter(f_table_name="twin")
+              assert {f.f_geometry_column:(f.type.lower(), f.srid) for f in fields} == expected
+              for f in fields:
+                  assert fields.get(pk=f.pk).f_table_schema == DATABASES[alias]["NAME"]
+          with db.cursor() as c:
+              c.execute("ALTER TABLE twin DROP COLUMN shape")
+          assert columns.filter(f_table_name="twin").count() == 1
+          print("Same-name tables in different databases, composite keys, typed and unrestricted SRIDs, and DDL introspection passed.")
+          def custom(srid):
+              return SpatialReference(SpatialReference(4326).wkt.replace('AUTHORITY["EPSG","4326"]', f'AUTHORITY["Django","{srid}"]'))
+          race_id = 110033120
+          assert not srs.filter(pk=race_id).exists()
+          with transaction.atomic():
+              add_srs_entry(4326)
+              try:
+                  add_srs_entry(custom(race_id), ref_sys_name="atomic test")
+              except TransactionManagementError:
+                  pass
+              else:
+                  raise AssertionError("DDL committed inside atomic")
+          assert not srs.filter(pk=race_id).exists()
+          gate = Barrier(8)
+          from django.db.models.query import QuerySet
+          old = QuerySet.exists
+          def synchronized(qs):
+              found = old(qs)
+              gate.wait(timeout=30)
+              return found
+          def register(k):
+              try:
+                  add_srs_entry(custom(race_id), auth_name="Django", ref_sys_name="Django's race %s" % k, database="other" if k%2 else "default")
+              finally:
+                  connections.close_all()
+          with patch.object(QuerySet, "exists", synchronized), ThreadPoolExecutor(max_workers=8) as pool:
+              list(pool.map(register, range(8)))
+          entry = srs.using("other").get(pk=race_id)
+          assert entry.ref_sys_name.startswith("Django's race ") and entry.auth_srid == race_id
+          for _ in range(40):
+              add_srs_entry(custom(race_id), ref_sys_name="replacement")
+          assert srs.get(pk=race_id).ref_sys_name == entry.ref_sys_name
+          print("8 simultaneous registrations, 40 retries, quoted names, transaction guard and cross-alias visibility passed.")
+          known = set(srs.values_list("srid",flat=True))
+          from django.contrib.gis.gdal.error import GDALException
+          for candidate in [8857,7855,9473, 8858, 9709, 9895, 3035, 32600, *range(9000,10000)]:
+              if candidate in known:
+                  continue
+              try:
+                  if not SpatialReference(candidate).projected:
+                      continue
+              except GDALException:
+                  continue
+              break
+          else:
+              raise AssertionError("No GDAL-only projected EPSG found")
+          field = PointField(srid=candidate)
+          for conn in (db,other):
+              assert not field.geodetic(conn)
+          add_srs_entry(custom(candidate), auth_name="Django", ref_sys_name="Newly registered test SRS", database="other")
+          for conn in (db,other):
+              assert field.geodetic(conn), "An earlier fallback hid the registered definition"
+          print("GDAL fallback refreshed on both open aliases after registration for SRID", candidate)
+          for value in (candidate,race_id):
+              with db.cursor() as c:
+                  c.execute("DROP SPATIAL REFERENCE SYSTEM %s",[value])
+          with db.cursor() as c:
+              c.execute("SELECT COUNT(*) FROM INFORMATION_SCHEMA.ST_SPATIAL_REFERENCE_SYSTEMS WHERE SRS_ID IN (%s,%s)",[race_id,candidate])
+              assert c.fetchone() == (0,)
+          try:
+              db.ops.spatial_function_name("Transform")
+          except NotSupportedError:
+              pass
+          else:
+              raise AssertionError("Transform was enabled")
+          PY
+          PYTHONPATH="$RUNNER_TEMP:$PWD/tests:$PWD" "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/stress_mysql.py"
       - name: Verify the regression and the SRID control on upstream main
+        if: matrix.image == 'mysql:8.4'
         run: |
           git fetch --depth=1 https://github.com/django/django.git c67d872765e05ebd009fadf7de8d834b01bae9e4
           git worktree add --detach "$RUNNER_TEMP/upstream" FETCH_HEAD
@@ -74,3 +203,31 @@ jobs:
           grep -F 'FAILED (errors=2)' "$RUNNER_TEMP/base.log"
           grep -F 'NotImplementedError:' "$RUNNER_TEMP/base.log" | grep 'geometry_columns()'
           grep -F 'NotImplementedError:' "$RUNNER_TEMP/base.log" | grep 'spatial_ref_sys()'
+  postgis:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s --health-timeout=3s --health-retries=30
+    steps:
+      - name: Test GeoDjango with PostGIS
+        run: |
+          git init .
+          git fetch --depth=1 https://github.com/gabrielrbl/django.git 0ceb9ca5c27f67af7432aa86a8757154ce20aa35
+          git checkout --detach FETCH_HEAD
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libgdal34t64 python3-venv
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install -e . "psycopg[binary]" Pillow tblib
+          cat > "$RUNNER_TEMP/ticket_postgis.py" <<'PY'
+          from test_sqlite import PASSWORD_HASHERS, SECRET_KEY, USE_TZ
+          DATABASES = {alias: {"ENGINE":"django.contrib.gis.db.backends.postgis","NAME":"postgres" if alias=="default" else "other","HOST":"127.0.0.1","USER":"postgres","PASSWORD":"postgres"} for alias in ("default","other")}
+          PY
+          cd tests
+          PYTHONPATH="$RUNNER_TEMP:$PWD/.." "$RUNNER_TEMP/venv/bin/python" runtests.py --settings=ticket_postgis --parallel=1 --shuffle=33120 gis_tests
